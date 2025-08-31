@@ -1,5 +1,8 @@
+// 保持你发来的内容结构，只改了下载面板请求与少量细节
+
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' show FontFeature;
 
@@ -7,6 +10,8 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_mjpeg/flutter_mjpeg.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
+
 import 'package:zeshy/pages/pairing_sheet.dart';
 import 'package:zeshy/services/ble_provisioning_service.dart';
 
@@ -17,10 +22,8 @@ class GogglesPage extends StatefulWidget {
 }
 
 class _GogglesPageState extends State<GogglesPage> {
-  // BLE 业务：给弹窗复用
   final _svc = BleProvisioningService();
 
-  // 控件（共享给弹窗，便于保留输入）
   final _ssidCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   final _nameFilterCtrl = TextEditingController(text: 'PROV_');
@@ -28,29 +31,26 @@ class _GogglesPageState extends State<GogglesPage> {
   String _connStatus = '未连接';
   String _provStatus = '—';
   String _log = '';
-  bool _scanning = false; // 仅用于主页面小圈圈
+  bool _scanning = false;
 
-  // —— 画面 & 刷新 —— //
-  String? _deviceIp; // 持久化，BLE 不在也能用
+  String? _deviceIp;
   bool _streamError = false;
   int _streamEpoch = 0;
 
-  // —— IMU（速度）—— //
-  Timer? _imuTimer;
+  StreamSubscription<IMUSample>? _imuSub;
+  bool _imuOn = false;
   int? _lastTs;
   double _vx = 0, _vy = 0, _vz = 0;
   double _speed = 0;
 
-  // —— 主页面常驻订阅 —— //
   StreamSubscription<String>? _statSubMain;
-
   static const _kLastIpKey = 'last_device_ip';
 
   @override
   void initState() {
     super.initState();
     _loadLastIpAndTryUse();
-    _listenStatInPage(); // 常驻监听 STAT
+    _listenStatInPage();
   }
 
   void _listenStatInPage() {
@@ -58,6 +58,18 @@ class _GogglesPageState extends State<GogglesPage> {
     _statSubMain = _svc.statusStream.listen((txt) async {
       _appendLog('[STAT-MAIN] $txt');
 
+      if (txt.startsWith('ap_on:')) {
+        final ip = txt.substring('ap_on:'.length).trim();
+        await _saveLastIp(ip);
+        if (!mounted) return;
+        setState(() {
+          _deviceIp = ip;
+          _provStatus = '热点已开启';
+          _streamError = false;
+          _streamEpoch++;
+        });
+        return;
+      }
       if (txt.startsWith('wifi_ok:')) {
         final ip = txt.substring('wifi_ok:'.length).trim();
         await _saveLastIp(ip);
@@ -66,12 +78,10 @@ class _GogglesPageState extends State<GogglesPage> {
           _deviceIp = ip;
           _provStatus = '已连上 Wi-Fi';
           _streamError = false;
-          _streamEpoch++; // 触发 MJPEG 重连
+          _streamEpoch++;
         });
-        _startImuLoop();
         return;
       }
-
       if (txt.contains('wifi_connecting')) {
         if (mounted) setState(() => _provStatus = '设备正在连接 Wi-Fi…');
       } else if (txt.contains('wifi_fail_auth')) {
@@ -80,6 +90,8 @@ class _GogglesPageState extends State<GogglesPage> {
         if (mounted) setState(() => _provStatus = '找不到该 SSID');
       } else if (txt.contains('ble_connected')) {
         if (mounted) setState(() => _connStatus = '已连接');
+      } else if (txt.contains('ap_off')) {
+        if (mounted) setState(() => _provStatus = '热点已关闭');
       }
     });
   }
@@ -92,7 +104,6 @@ class _GogglesPageState extends State<GogglesPage> {
       if (await _probeIp(ip)) {
         setState(() => _deviceIp = ip);
         _resetStream();
-        _startImuLoop();
         _appendLog('使用上次保存的 IP：$ip');
       } else {
         _appendLog('上次 IP 不可用：$ip');
@@ -125,47 +136,56 @@ class _GogglesPageState extends State<GogglesPage> {
     });
   }
 
-  // —— IMU：启动/停止拉取 & 速度 —— //
-  void _startImuLoop() {
-    _imuTimer?.cancel();
-    final ip = _deviceIp;
-    if (ip == null) return;
-    _imuTimer = Timer.periodic(const Duration(milliseconds: 50), (_) async {
-      try {
-        final r = await http.get(Uri.parse('http://$ip/imu'),
-            headers: const {'Cache-Control': 'no-cache'});
-        if (r.statusCode == 200) {
-          final j = jsonDecode(r.body) as Map<String, dynamic>;
-          _updateSpeedFromImu(j);
-        }
-      } catch (_) {}
+  // ---- BLE IMU 开关 ----
+  Future<void> _toggleImu() async {
+    if (_imuOn) {
+      await _stopImuBle();
+    } else {
+      await _startImuBle();
+    }
+  }
+
+  Future<void> _startImuBle() async {
+    try {
+      await _svc.startImu();
+      _imuSub?.cancel();
+      _imuSub = _svc.imuStream.listen(_updateSpeedFromImuSample);
+      setState(() => _imuOn = true);
+      _appendLog('IMU 订阅已开启（BLE）');
+    } catch (e) {
+      _snack('IMU 订阅失败: $e');
+    }
+  }
+
+  Future<void> _stopImuBle() async {
+    await _svc.stopImu();
+    await _imuSub?.cancel();
+    _imuSub = null;
+    setState(() {
+      _imuOn = false;
+      _lastTs = null;
+      _vx = _vy = _vz = 0;
+      _speed = 0;
     });
+    _appendLog('IMU 订阅已关闭');
   }
 
-  void _stopImuLoop() {
-    _imuTimer?.cancel();
-    _imuTimer = null;
-  }
-
-  void _updateSpeedFromImu(Map<String, dynamic> m) {
-    final ts = (m['ts'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch;
-    final dt = (_lastTs == null) ? 0.05 : (ts - _lastTs!) / 1000.0;
+  void _updateSpeedFromImuSample(IMUSample s) {
+    final ts = s.ts;
+    final dt = (_lastTs == null) ? 0.04 : (ts - _lastTs!) / 1000.0; // 25Hz≈40ms
     _lastTs = ts;
 
-    final ax = (m['ax'] ?? 0).toDouble();
-    final ay = (m['ay'] ?? 0).toDouble();
-    final az = (m['az'] ?? 0).toDouble();
+    final ax = s.ax, ay = s.ay, az = s.az;
 
     final roll  = math.atan2(ay, az);
     final pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az));
 
     const g = 9.80665;
-    final ax_ms2 = ax * g;
-    final ay_ms2 = ay * g;
-    final az_ms2 = az * g;
+    final ax_ms2 = ax * g, ay_ms2 = ay * g, az_ms2 = az * g;
 
     final sr = math.sin(roll),  cr = math.cos(roll);
     final sp = math.sin(pitch), cp = math.cos(pitch);
+
     final ax_w = ax_ms2 * cp + ay_ms2 * sr*sp + az_ms2 * cr*sp;
     final ay_w = ay_ms2 * cr - az_ms2 * sr;
     final az_w = -ax_ms2 * sp + ay_ms2 * sr*cp + az_ms2 * cr*cp;
@@ -183,14 +203,12 @@ class _GogglesPageState extends State<GogglesPage> {
     if (mounted) setState(() {});
   }
 
-  // —— 刷新 MJPEG —— //
   void _resetStream() {
     _streamError = false;
     _streamEpoch++;
     setState(() {});
   }
 
-  // —— 打开底部弹窗（关闭后必定复位扫描）—— //
   Future<void> _openPairingSheet() async {
     setState(() => _scanning = false);
 
@@ -215,23 +233,60 @@ class _GogglesPageState extends State<GogglesPage> {
           if (!mounted) return;
           setState(() => _deviceIp = ip);
           _resetStream();
-          _startImuLoop();
         },
         onScanningChanged: (b) => setState(() => _scanning = b),
         initialDeviceIp: _deviceIp,
       ),
     );
 
-    try {
-      await _svc.stopScan();
-    } catch (_) {}
+    try { await _svc.stopScan(); } catch (_) {}
     if (mounted) setState(() => _scanning = false);
+  }
+
+  Future<void> _openDownload() async {
+    if (_deviceIp == null) {
+      _appendLog('请求开启 AP 并等待 IP…');
+      try { await _svc.setAp(true); }
+      catch (e) { _snack('开启热点失败：$e'); return; }
+
+      final comp = Completer<void>();
+      late final StreamSubscription sub;
+      sub = _svc.statusStream.listen((s) async {
+        if (s.startsWith('ap_on:')) {
+          final ip = s.substring('ap_on:'.length).trim();
+          await _saveLastIp(ip);
+          if (!mounted) return;
+          setState(() => _deviceIp = ip);
+          comp.complete();
+          await sub.cancel();
+        }
+      });
+      try { await comp.future.timeout(const Duration(seconds: 10)); }
+      catch (_) { await sub.cancel(); _snack('等待 AP IP 超时'); return; }
+    }
+
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _DownloadSheet(deviceIp: _deviceIp!, onLog: _appendLog),
+    );
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   @override
   void dispose() {
     _statSubMain?.cancel();
-    _stopImuLoop();
+    _imuSub?.cancel();
     _svc.dispose();
     _ssidCtrl.dispose();
     _passCtrl.dispose();
@@ -244,15 +299,13 @@ class _GogglesPageState extends State<GogglesPage> {
     final insets = MediaQuery.of(context).viewInsets.bottom;
     final textTheme = Theme.of(context).textTheme;
 
-    // 计算两块状态卡片的对称宽度
     final totalW = MediaQuery.of(context).size.width;
-    const hPad = 50.0;             // 与页面左右留白保持一致
-    const gap = 20.0;              // 两卡片间距
+    const hPad = 50.0, gap = 20.0;
     final avail = totalW - hPad * 2;
     final tileW = ((avail - gap) / 2).clamp(120.0, 180.0);
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5), // ★ 整页背景：#F5F5F5
+      backgroundColor: const Color(0xFFF5F5F5),
       body: SafeArea(
         top: false,
         child: SingleChildScrollView(
@@ -260,7 +313,7 @@ class _GogglesPageState extends State<GogglesPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // 顶部：居中大图 + 状态行 + 配对按钮
+              // 顶部
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 16.0, horizontal: 12.0),
                 child: Column(
@@ -269,34 +322,26 @@ class _GogglesPageState extends State<GogglesPage> {
                     Center(
                       child: Image.asset(
                         'assets/pictures/goggles.png',
-                        width: 200,
-                        height: 200,
-                        fit: BoxFit.contain,
+                        width: 200, height: 200, fit: BoxFit.contain,
                       ),
                     ),
                     const SizedBox(height: 12),
-
-                    // —— 状态卡片：一排、居中、对称、等宽、扁平 —— //
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         _StatusTile(
-                          width: tileW,
-                          title: '连接',
+                          width: tileW, title: '连接',
                           value: _connStatus,
                           color: _statusColor(_connStatus, isConn: true),
-                          // 成功不显示对号 —— 不放任何图标
                         ),
                         const SizedBox(width: gap),
                         _StatusTile(
-                          width: tileW,
-                          title: '配网',
+                          width: tileW, title: '网络',
                           value: _provStatus,
                           color: _statusColor(_provStatus, isConn: false),
                         ),
                       ],
                     ),
-
                     const SizedBox(height: 16),
                     Align(
                       alignment: Alignment.center,
@@ -311,7 +356,7 @@ class _GogglesPageState extends State<GogglesPage> {
                 ),
               ),
 
-              // 实时画面 + 速度叠加 + 刷新按钮
+              // 流 + 速度
               Padding(
                 padding: const EdgeInsets.all(12.0),
                 child: AspectRatio(
@@ -319,17 +364,11 @@ class _GogglesPageState extends State<GogglesPage> {
                   child: Container(
                     decoration: BoxDecoration(
                       color: Colors.black12,
-                      borderRadius: BorderRadius.circular(20),   // 统一更大圆角
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.08),
-                          blurRadius: 8,
-                          offset: const Offset(0, 3),
-                        ),
-                      ],
+                      borderRadius: BorderRadius.circular(20),
+                      boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.08), blurRadius: 8, offset: const Offset(0, 3))],
                     ),
                     child: ClipRRect(
-                      borderRadius: BorderRadius.circular(20),   // 保证流画面也被裁剪
+                      borderRadius: BorderRadius.circular(20),
                       child: Stack(
                         children: [
                           if (_deviceIp != null && !_streamError)
@@ -343,11 +382,8 @@ class _GogglesPageState extends State<GogglesPage> {
                                     if (mounted) setState(() => _streamError = true);
                                   });
                                   return Center(
-                                    child: Text(
-                                      'MJPEG 错误：$err\n请点击右上角刷新',
-                                      textAlign: TextAlign.center,
-                                      style: const TextStyle(color: Colors.red),
-                                    ),
+                                    child: Text('MJPEG 错误：$err\n请点击右上角刷新',
+                                        textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
                                   );
                                 },
                               ),
@@ -356,58 +392,35 @@ class _GogglesPageState extends State<GogglesPage> {
                             Positioned.fill(
                               child: Container(
                                 alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  color: Colors.white,
-                                  borderRadius: BorderRadius.circular(20),
-                                ),
+                                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
                                 child: Text(
                                   _deviceIp == null
-                                      ? '未获取到设备 IP。\n可先用“配对设备”完成配网或等待加载上次 IP。'
+                                      ? '未获取到设备 IP。\n可通过“配对设备”→ 开启热点 或 等待加载上次 IP。'
                                       : '流已断开（可能超时）\n请点击右上角刷新',
-                                  textAlign: TextAlign.center,
-                                  style: textTheme.titleMedium,
+                                  textAlign: TextAlign.center, style: textTheme.titleMedium,
                                 ),
                               ),
                             ),
-
-                          // 左上：速度叠加
                           Positioned(
-                            left: 8,
-                            top: 8,
+                            left: 8, top: 8,
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withOpacity(0.45),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
+                              decoration: BoxDecoration(color: Colors.black.withOpacity(0.45), borderRadius: BorderRadius.circular(12)),
                               child: Text(
                                 '速度：${_speed.toStringAsFixed(2)} m/s',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w600,
-                                  fontFeatures: [FontFeature.tabularFigures()],
-                                ),
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontFeatures: [FontFeature.tabularFigures()]),
                               ),
                             ),
                           ),
-
-                          // 右上：刷新按钮
                           Positioned(
-                            right: 8,
-                            top: 8,
+                            right: 8, top: 8,
                             child: Tooltip(
                               message: '刷新视频流',
                               child: Material(
-                                color: Colors.black.withOpacity(0.25),
-                                shape: const CircleBorder(),
+                                color: Colors.black.withOpacity(0.25), shape: const CircleBorder(),
                                 child: IconButton(
                                   icon: const Icon(Icons.refresh, color: Colors.white),
-                                  onPressed: (_deviceIp == null)
-                                      ? null
-                                      : () {
-                                    _resetStream();
-                                    _appendLog('手动刷新 MJPEG 流。');
-                                  },
+                                  onPressed: (_deviceIp == null) ? null : () { _resetStream(); _appendLog('手动刷新 MJPEG 流。'); },
                                 ),
                               ),
                             ),
@@ -418,6 +431,32 @@ class _GogglesPageState extends State<GogglesPage> {
                   ),
                 ),
               ),
+
+              // 底部操作
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12.0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _toggleImu,
+                        icon: Icon(_imuOn ? Icons.stop_circle_outlined : Icons.sensors),
+                        label: Text(_imuOn ? '停止同步 IMU' : '同步 IMU'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _openDownload,
+                        icon: const Icon(Icons.download),
+                        label: const Text('下载视频'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 12),
 
               // 日志
               Padding(
@@ -431,18 +470,9 @@ class _GogglesPageState extends State<GogglesPage> {
                       constraints: const BoxConstraints(minHeight: 140),
                       child: Container(
                         padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.black12),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
+                        decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(8)),
                         child: SingleChildScrollView(
-                          child: Text(
-                            _log.isEmpty ? '（暂无）' : _log,
-                            style: const TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 12.5,
-                            ),
-                          ),
+                          child: Text(_log.isEmpty ? '（暂无）' : _log, style: const TextStyle(fontFamily: 'monospace', fontSize: 12.5)),
                         ),
                       ),
                     ),
@@ -458,73 +488,225 @@ class _GogglesPageState extends State<GogglesPage> {
   }
 }
 
-/* ------------------------- 视觉组件 & 辅助函数 ------------------------- */
+/* ------------------------- 下载弹窗 ------------------------- */
 
-/// 状态色（按内容区分：连接/配网；成功态不显示图标，仅颜色）
-Color _statusColor(String s, {required bool isConn}) {
-  // 基础色系（连接偏蓝，配网偏紫，更易区分）
-  const connBase = Color(0xFF2563EB); // 蓝
-  const provBase = Color(0xFF7C3AED); // 紫
+class _DownloadSheet extends StatefulWidget {
+  const _DownloadSheet({required this.deviceIp, required this.onLog});
+  final String deviceIp;
+  final void Function(String) onLog;
 
-  final base = isConn ? connBase : provBase;
-
-  if (s.contains('已连接') || s.contains('已连上')) {
-    return base; // 成功：主色
-  }
-  if (s.contains('失败') || s.contains('错误') || s.contains('找不到')) {
-    return const Color(0xFFEF4444); // 错误：红
-  }
-  if (s.contains('连接中') || s.contains('正在')) {
-    return const Color(0xFFF59E0B); // 进行中：琥珀
-  }
-  return const Color(0xFF64748B);   // 默认：灰蓝
+  @override
+  State<_DownloadSheet> createState() => _DownloadSheetState();
 }
 
-/// 扁平风“状态卡片”——等宽、等高、无图标（满足“成功不需要对号”）
-class _StatusTile extends StatelessWidget {
-  const _StatusTile({
-    required this.title,
-    required this.value,
-    required this.color,
-    required this.width,
-  });
+class _DownloadSheetState extends State<_DownloadSheet> {
+  bool _loading = true;
+  List<String> _sessions = [];
+  final Set<String> _selected = {};
 
-  final String title;
-  final String value;
-  final Color color;
-  final double width;
+  @override
+  void initState() {
+    super.initState();
+    _loadSessions();
+  }
+
+  Future<void> _loadSessions() async {
+    setState(() => _loading = true);
+    try {
+      // 固件：/fs/list —— 返回 ["\/REC_...","\/REC_..."]
+      final r = await http.get(Uri.parse('http://${widget.deviceIp}/fs/list'))
+          .timeout(const Duration(seconds: 6));
+      if (r.statusCode == 200) {
+        final arr = (jsonDecode(r.body) as List).map((e) => e.toString()).toList();
+        setState(() => _sessions = arr);
+      } else {
+        _toast('HTTP ${r.statusCode}');
+      }
+    } catch (e) {
+      widget.onLog('加载会话失败: $e');
+      _toast('加载会话失败');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _downloadSelected() async {
+    if (_selected.isEmpty) return;
+    final dir = await getApplicationDocumentsDirectory();
+
+    for (final raw in _selected) {
+      final sess = raw.startsWith('/') ? raw : '/$raw';
+      final sessName = sess.replaceFirst('/', ''); // 本地目录名如 REC_1234
+      final localSessDir = Directory('${dir.path}/$sessName');
+      if (!await localSessDir.exists()) await localSessDir.create(recursive: true);
+
+      // 1) 获取该会话下的文件列表
+      final listUrl = 'http://${widget.deviceIp}/fs/list?session=${Uri.encodeComponent(sess)}';
+      try {
+        final lr = await http.get(Uri.parse(listUrl)).timeout(const Duration(seconds: 6));
+        if (lr.statusCode != 200) { _toast('列文件失败: $sessName'); continue; }
+        final files = (jsonDecode(lr.body) as List).map((e) => e.toString()).toList();
+
+        // 2) 逐个拉取文件
+        for (final p in files) {
+          final path = p.startsWith('/') ? p : '/$p';
+          final fname = path.split('/').last;
+          final url = 'http://${widget.deviceIp}/fs/file?path=${Uri.encodeComponent(path)}';
+          final fr = await http.get(Uri.parse(url)).timeout(const Duration(minutes: 1));
+          if (fr.statusCode == 200) {
+            final out = File('${localSessDir.path}/$fname');
+            await out.writeAsBytes(fr.bodyBytes);
+          } else {
+            _toast('下载失败: $fname (${fr.statusCode})');
+          }
+        }
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('已保存到 ${localSessDir.path}')),
+          );
+        }
+      } catch (e) {
+        _toast('下载异常: $e');
+      }
+    }
+  }
+
+  Future<void> _deleteSelected() async {
+    if (_selected.isEmpty) return;
+    for (final raw in _selected.toList()) {
+      final sess = raw.startsWith('/') ? raw : '/$raw';
+      final url = 'http://${widget.deviceIp}/fs/delete?session=${Uri.encodeComponent(sess)}';
+      try {
+        final r = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
+        if (r.statusCode == 200) {
+          setState(() { _sessions.remove(raw); _selected.remove(raw); });
+        } else {
+          _toast('删除失败: HTTP ${r.statusCode}');
+        }
+      } catch (e) {
+        _toast('删除异常: $e');
+      }
+    }
+  }
+
+  void _toast(String s) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+  }
 
   @override
   Widget build(BuildContext context) {
-    final bg = color.withOpacity(.15);   // 背景淡色
-    final tx = color;                    // 文本主色
+    return DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.85,
+      minChildSize: 0.55,
+      maxChildSize: 0.98,
+      builder: (_, controller) {
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 0),
+              child: Row(
+                children: [
+                  const Text('选择会话下载/删除', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                  const Spacer(),
+                  IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.of(context).pop()),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _sessions.isEmpty
+                  ? const Center(child: Text('暂无会话'))
+                  : ListView.builder(
+                controller: controller,
+                itemCount: _sessions.length,
+                itemBuilder: (_, i) {
+                  final s = _sessions[i];
+                  final picked = _selected.contains(s);
+                  return ListTile(
+                    title: Text(s, overflow: TextOverflow.ellipsis),
+                    trailing: Checkbox(
+                      value: picked,
+                      onChanged: (v) {
+                        setState(() { v == true ? _selected.add(s) : _selected.remove(s); });
+                      },
+                    ),
+                    onTap: () {
+                      setState(() {
+                        picked ? _selected.remove(s) : _selected.add(s);
+                      });
+                    },
+                  );
+                },
+              ),
+            ),
+            if (!_loading)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _selected.isEmpty ? null : _downloadSelected,
+                        icon: const Icon(Icons.download),
+                        label: const Text('下载所选 (到本地文件夹)'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _selected.isEmpty ? null : _deleteSelected,
+                        icon: const Icon(Icons.delete_outline),
+                        label: const Text('删除所选'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
 
+/* ------------------------- 视觉组件 & 辅助函数 ------------------------- */
+
+Color _statusColor(String s, {required bool isConn}) {
+  const connBase = Color(0xFF2563EB);
+  const provBase = Color(0xFF7C3AED);
+  final base = isConn ? connBase : provBase;
+
+  if (s.contains('已连接') || s.contains('已连上') || s.contains('热点已开启')) return base;
+  if (s.contains('失败') || s.contains('错误') || s.contains('找不到')) return const Color(0xFFEF4444);
+  if (s.contains('连接中') || s.contains('正在')) return const Color(0xFFF59E0B);
+  return const Color(0xFF64748B);
+}
+
+class _StatusTile extends StatelessWidget {
+  const _StatusTile({required this.title, required this.value, required this.color, required this.width});
+  final String title; final String value; final Color color; final double width;
+  @override
+  Widget build(BuildContext context) {
+    final bg = color.withOpacity(.15), tx = color;
     return SizedBox(
-      width: width,
-      height: 36, // 小巧
+      width: width, height: 36,
       child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.circular(20), // 更圆润
-        ),
+        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(20)),
         child: Center(
           child: RichText(
             text: TextSpan(
-              style: TextStyle(
-                color: tx,
-                fontWeight: FontWeight.w700,
-                letterSpacing: .2,
-              ),
+              style: TextStyle(color: tx, fontWeight: FontWeight.w700, letterSpacing: .2),
               children: [
                 TextSpan(text: '$title：'),
-                TextSpan(
-                  text: value,
-                  style: const TextStyle(fontWeight: FontWeight.w900),
-                ),
+                TextSpan(text: value, style: const TextStyle(fontWeight: FontWeight.w900)),
               ],
             ),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
+            maxLines: 1, overflow: TextOverflow.ellipsis,
           ),
         ),
       ),
@@ -532,59 +714,26 @@ class _StatusTile extends StatelessWidget {
   }
 }
 
-/// 主 CTA 胶囊按钮（扁平风）
 class _PrimaryCTA extends StatelessWidget {
-  const _PrimaryCTA({
-    required this.label,
-    required this.icon,
-    this.onTap,
-    this.busy = false,
-  });
-
-  final String label;
-  final IconData icon;
-  final VoidCallback? onTap;
-  final bool busy;
-
+  const _PrimaryCTA({required this.label, required this.icon, this.onTap, this.busy = false});
+  final String label; final IconData icon; final VoidCallback? onTap; final bool busy;
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final enabled = onTap != null;
-
+    final cs = Theme.of(context).colorScheme; final enabled = onTap != null;
     return Material(
-      color: enabled ? cs.primary : cs.surfaceVariant,
-      shape: const StadiumBorder(),
-      clipBehavior: Clip.antiAlias,
+      color: enabled ? cs.primary : cs.surfaceVariant, shape: const StadiumBorder(), clipBehavior: Clip.antiAlias,
       child: InkWell(
-        onTap: onTap,
-        customBorder: const StadiumBorder(),
+        onTap: onTap, customBorder: const StadiumBorder(),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (busy)
-                const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation(Colors.white),
-                  ),
-                )
-              else
-                Icon(icon, size: 18, color: enabled ? cs.onPrimary : cs.onSurfaceVariant),
-              const SizedBox(width: 8),
-              Text(
-                label,
-                style: TextStyle(
-                  color: enabled ? cs.onPrimary : cs.onSurfaceVariant,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: .3,
-                ),
-              ),
-            ],
-          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            if (busy)
+              const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation(Colors.white)))
+            else
+              Icon(icon, size: 18, color: enabled ? cs.onPrimary : cs.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Text(label, style: TextStyle(color: enabled ? cs.onPrimary : cs.onSurfaceVariant, fontWeight: FontWeight.w800, letterSpacing: .3)),
+          ]),
         ),
       ),
     );

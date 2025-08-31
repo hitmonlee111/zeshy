@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 
-/// 简单异常类型
 class BleProvError implements Exception {
   final String message;
   BleProvError(this.message);
@@ -10,7 +9,6 @@ class BleProvError implements Exception {
   String toString() => 'BleProvError: $message';
 }
 
-/// GATT UUID 常量（与设备固件一致）
 class ProvUuids {
   static final Uuid service = Uuid.parse("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
   static final Uuid ssid    = Uuid.parse("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
@@ -19,98 +17,108 @@ class ProvUuids {
   static final Uuid stat    = Uuid.parse("6E400005-B5A3-F393-E0A9-E50E24DCCA9E");
 }
 
-/// 设备发现结果（给上层用）
+class ImuUuids {
+  static final Uuid service = Uuid.parse("7E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+  static final Uuid imuNtf  = Uuid.parse("7E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+  static final Uuid apCtrl  = Uuid.parse("7E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+}
+
 class ProvDevice {
-  final String id;   // deviceId / MAC(安卓) / UUID(iOS)
-  final String name; // 广播名（例如 PROV_xxxx）
+  final String id;
+  final String name;
   final int rssi;
   ProvDevice({required this.id, required this.name, required this.rssi});
 }
 
-/// BLE 配网接口层（无 UI/业务逻辑）
+class IMUSample {
+  final int ts;     // ms since boot
+  final double ax, ay, az; // g
+  final double gx, gy, gz; // deg/s
+  IMUSample({required this.ts, required this.ax, required this.ay, required this.az,
+    required this.gx, required this.gy, required this.gz});
+  factory IMUSample.fromJson(Map<String, dynamic> m) => IMUSample(
+    ts: (m['ts'] as num).toInt(),
+    ax: (m['ax'] as num).toDouble(),
+    ay: (m['ay'] as num).toDouble(),
+    az: (m['az'] as num).toDouble(),
+    gx: (m['gx'] as num).toDouble(),
+    gy: (m['gy'] as num).toDouble(),
+    gz: (m['gz'] as num).toDouble(),
+  );
+}
+
 class BleProvisioningService {
   final FlutterReactiveBle _ble;
+  BleProvisioningService({FlutterReactiveBle? ble}) : _ble = ble ?? FlutterReactiveBle();
 
-  BleProvisioningService({FlutterReactiveBle? ble})
-      : _ble = ble ?? FlutterReactiveBle();
-
-  // ---- 内部状态 ----
   StreamSubscription<DiscoveredDevice>? _scanSub;
   StreamSubscription<ConnectionStateUpdate>? _connSub;
-  StreamSubscription<List<int>>? _statNotifySub;
 
   String? _deviceId;
-  QualifiedCharacteristic? _ssidChar, _passChar, _goChar, _statChar;
+  QualifiedCharacteristic? _ssidCh, _passCh, _goCh, _statCh;
+  QualifiedCharacteristic? _imuNtfCh, _apCtrlCh;
 
   final _statusController = StreamController<String>.broadcast();
   final _connStateController = StreamController<DeviceConnectionState>.broadcast();
+  final _imuController = StreamController<IMUSample>.broadcast();
 
-  /// 设备状态通知（来自 STAT 特征或内部事件）
   Stream<String> get statusStream => _statusController.stream;
-
-  /// 原生连接状态流（可选）
   Stream<DeviceConnectionState> get connectionState => _connStateController.stream;
+  Stream<IMUSample> get imuStream => _imuController.stream;
 
-  // ---------- 扫描 ----------
-  /// 过滤扫描，返回包含 Service UUID 的设备流（上层自己做去重/列表）
-  Stream<ProvDevice> scan({Duration? timeout}) {
-    // 停掉旧扫描
+  // 扫描：用名字前缀即可（设备连接后不会再被扫到）
+  Stream<ProvDevice> scan({Duration? timeout, String namePrefix = "PROV_"}) {
     _scanSub?.cancel();
-    final controller = StreamController<ProvDevice>();
-
-    _scanSub = _ble
-        .scanForDevices(withServices: [ProvUuids.service], scanMode: ScanMode.lowLatency)
-        .listen((d) {
-      controller.add(ProvDevice(id: d.id, name: d.name, rssi: d.rssi));
-    }, onError: controller.addError);
-
+    final ctrl = StreamController<ProvDevice>();
+    _scanSub = _ble.scanForDevices(withServices: const [], scanMode: ScanMode.lowLatency).listen(
+          (d) {
+        if (namePrefix.isNotEmpty && !d.name.startsWith(namePrefix)) return;
+        ctrl.add(ProvDevice(id: d.id, name: d.name, rssi: d.rssi));
+      },
+      onError: ctrl.addError,
+    );
     if (timeout != null) {
-      Future.delayed(timeout, () async {
-        await _scanSub?.cancel();
-        await controller.close();
-      });
+      Future.delayed(timeout, () async { await _scanSub?.cancel(); await ctrl.close(); });
     }
-    return controller.stream;
+    return ctrl.stream;
   }
 
   Future<void> stopScan() async => _scanSub?.cancel();
 
-  // ---------- 连接 / 断开 ----------
   Future<void> connect(String deviceId, {Duration? timeout}) async {
+    // 关键：连接前停止扫描，避免冲突
+    await stopScan();
     await disconnect();
 
     final comp = Completer<void>();
-    _connSub = _ble
-        .connectToDevice(id: deviceId, connectionTimeout: timeout)
-        .listen((update) async {
-      _connStateController.add(update.connectionState);
+    _connSub = _ble.connectToDevice(id: deviceId, connectionTimeout: timeout).listen((u) async {
+      _connStateController.add(u.connectionState);
 
-      if (update.connectionState == DeviceConnectionState.connected) {
+      if (u.connectionState == DeviceConnectionState.connected) {
         _deviceId = deviceId;
-        await _setupCharacteristics(deviceId);
+        await _setupChars(deviceId);
 
-        // 1) 申请较大 MTU（忽略失败）
         try { await _ble.requestMtu(deviceId: deviceId, mtu: 247); } catch (_) {}
 
-        // 2) 订阅 STAT（分包重组）
-        _startStatusNotify();
-
-        // 3) 发一个“已连上 BLE”的状态给上层
+        _startStatNotify();                  // 订阅通知
         _statusController.add("ble_connected");
 
-        // 4) 读一次快照（如果设备在我们订阅之前刚好写过一次）
+        // 读取一次快照（强制 GATT 读，确认畅通）
         try {
           final snap = await readStatus();
-          final s = snap.trim();
-          if (s.isNotEmpty) _statusController.add(s);
+          if (snap.isNotEmpty) {
+            // 逐行透传到上层，和 notify 行保持一致
+            for (final line in snap.split(RegExp(r'[\r\n]+'))) {
+              final t = line.trim();
+              if (t.isNotEmpty) _statusController.add(t);
+            }
+          }
         } catch (_) {}
 
         if (!comp.isCompleted) comp.complete();
-      } else if (update.connectionState == DeviceConnectionState.disconnected) {
+      } else if (u.connectionState == DeviceConnectionState.disconnected) {
         _statusController.add("ble_disconnected");
-        if (!comp.isCompleted) {
-          comp.completeError(BleProvError("Disconnected before ready"));
-        }
+        if (!comp.isCompleted) comp.completeError(BleProvError("Disconnected before ready"));
       }
     }, onError: (e) {
       if (!comp.isCompleted) comp.completeError(e);
@@ -120,122 +128,85 @@ class BleProvisioningService {
   }
 
   Future<void> disconnect() async {
-    await _statNotifySub?.cancel();
-    _statNotifySub = null;
-    await _connSub?.cancel();
-    _connSub = null;
+    await stopImu();
     _deviceId = null;
-    _ssidChar = _passChar = _goChar = _statChar = null;
-    _statBuf.clear();
+    _ssidCh = _passCh = _goCh = _statCh = null;
+    _imuNtfCh = _apCtrlCh = null;
+    await _connSub?.cancel(); _connSub = null;
   }
 
-  // ---------- 写入/读取 ----------
+  Future<void> _setupChars(String deviceId) async {
+    _ssidCh = QualifiedCharacteristic(deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.ssid);
+    _passCh = QualifiedCharacteristic(deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.pass);
+    _goCh   = QualifiedCharacteristic(deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.go);
+    _statCh = QualifiedCharacteristic(deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.stat);
+
+    _imuNtfCh = QualifiedCharacteristic(deviceId: deviceId, serviceId: ImuUuids.service, characteristicId: ImuUuids.imuNtf);
+    _apCtrlCh = QualifiedCharacteristic(deviceId: deviceId, serviceId: ImuUuids.service, characteristicId: ImuUuids.apCtrl);
+  }
+
+  StreamSubscription<List<int>>? _statSub;
+  void _startStatNotify() {
+    final ch = _statCh; if (ch == null) return;
+    _statSub?.cancel();
+    _statSub = _ble.subscribeToCharacteristic(ch).listen((data) {
+      final s = _safeDecode(data);
+      for (final line in s.split(RegExp(r'[\r\n]+'))) {
+        final t = line.trim();
+        if (t.isNotEmpty) _statusController.add(t);
+      }
+    }, onError: (_) => _statusController.add("stat_notify_error"));
+  }
+
   Future<void> writeSsid(String ssid) async {
-    final ch = _ssidChar;
-    if (ch == null) throw BleProvError("Not connected / SSID char missing");
+    final ch = _ssidCh; if (ch == null) throw BleProvError("SSID char missing");
     await _ble.writeCharacteristicWithResponse(ch, value: utf8.encode(ssid));
   }
-
-  Future<void> writePassword(String password) async {
-    final ch = _passChar;
-    if (ch == null) throw BleProvError("Not connected / PASS char missing");
-    await _ble.writeCharacteristicWithResponse(ch, value: utf8.encode(password));
+  Future<void> writePassword(String pass) async {
+    final ch = _passCh; if (ch == null) throw BleProvError("PASS char missing");
+    await _ble.writeCharacteristicWithResponse(ch, value: utf8.encode(pass));
   }
-
-  /// 触发 GO=1，开始连 Wi-Fi
   Future<void> sendGo() async {
-    final ch = _goChar;
-    if (ch == null) throw BleProvError("Not connected / GO char missing");
+    final ch = _goCh; if (ch == null) throw BleProvError("GO char missing");
     await _ble.writeCharacteristicWithResponse(ch, value: utf8.encode("1"));
   }
-
-  /// 读取当前 STAT 字符串（可选）
   Future<String> readStatus() async {
-    final ch = _statChar;
-    if (ch == null) throw BleProvError("Not connected / STAT char missing");
-    final data = await _ble.readCharacteristic(ch);
-    return _safeDecode(data).trim();
+    final ch = _statCh; if (ch == null) throw BleProvError("STAT char missing");
+    return _safeDecode(await _ble.readCharacteristic(ch)).trim();
   }
 
-  // ---------- 内部：发现特征 / 订阅 STAT（带分包重组） ----------
-  Future<void> _setupCharacteristics(String deviceId) async {
-    _ssidChar = QualifiedCharacteristic(
-        deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.ssid);
-    _passChar = QualifiedCharacteristic(
-        deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.pass);
-    _goChar = QualifiedCharacteristic(
-        deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.go);
-    _statChar = QualifiedCharacteristic(
-        deviceId: deviceId, serviceId: ProvUuids.service, characteristicId: ProvUuids.stat);
+  Future<void> setAp(bool on) async {
+    final ch = _apCtrlCh; if (ch == null) throw BleProvError("AP_CTRL char missing");
+    await _ble.writeCharacteristicWithResponse(ch, value: utf8.encode(on ? "1" : "0"));
   }
+  Future<void> apOn() => setAp(true);
+  Future<void> apOff() => setAp(false);
 
-  // 用来拼接分包的缓冲区
-  final StringBuffer _statBuf = StringBuffer();
-  String? _lastWifiOkIp; // 简单去重
-
-  void _startStatusNotify() {
-    final ch = _statChar;
-    if (ch == null) return;
-
-    _statNotifySub?.cancel();
-    _statNotifySub = _ble.subscribeToCharacteristic(ch).listen((data) {
-      final chunk = _safeDecode(data);
-      _handleStatChunk(chunk);
-    }, onError: (e) {
-      _statusController.add("stat_notify_error");
+  StreamSubscription<List<int>>? _imuSub;
+  Future<void> startImu() async {
+    final ch = _imuNtfCh; if (ch == null) throw BleProvError("IMU notify char missing");
+    _imuSub?.cancel();
+    _imuSub = _ble.subscribeToCharacteristic(ch).listen((data) {
+      try {
+        final m = jsonDecode(_safeDecode(data)) as Map<String, dynamic>;
+        _imuController.add(IMUSample.fromJson(m));
+      } catch (_) {}
     });
   }
-
-  // 处理分包/黏包：按行分发；同时在整个缓冲里匹配 wifi_ok:IP
-  void _handleStatChunk(String chunk) {
-    if (chunk.isEmpty) return;
-
-    _statBuf.write(chunk);
-    final whole = _statBuf.toString();
-
-    // 1) 按行切分，把完整的行依次发出（末尾可能有半行，先保留在缓冲）
-    final parts = whole.split(RegExp(r'[\r\n]+'));
-    final endedWithNewline = RegExp(r'[\r\n]+$').hasMatch(whole);
-    final completeCount = endedWithNewline ? parts.length : (parts.length - 1);
-
-    for (var i = 0; i < completeCount; i++) {
-      final line = parts[i].trim();
-      if (line.isNotEmpty) {
-        _statusController.add(line);
-      }
-    }
-
-    // 2) 如果缓冲里包含 wifi_ok:IP，不论是否按行对齐，都额外发一次（去重）
-    final match = RegExp(r'wifi_ok:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})').firstMatch(whole);
-    if (match != null) {
-      final ip = match.group(1)!;
-      if (ip != _lastWifiOkIp) {
-        _lastWifiOkIp = ip;
-        _statusController.add('wifi_ok:$ip');
-      }
-    }
-
-    // 3) 只保留未完成的半行在缓冲中
-    final leftover = endedWithNewline ? '' : parts.last;
-    _statBuf
-      ..clear()
-      ..write(leftover);
-  }
+  Future<void> stopImu() async { await _imuSub?.cancel(); _imuSub = null; }
 
   String _safeDecode(List<int> data) {
-    try {
-      // 允许格式不规范的字节，尽量别抛异常
-      return utf8.decode(data, allowMalformed: true);
-    } catch (_) {
-      // 退化为直接字节串
-      return String.fromCharCodes(data);
-    }
+    try { return utf8.decode(data, allowMalformed: true); }
+    catch (_) { return String.fromCharCodes(data); }
   }
 
   Future<void> dispose() async {
-    await stopScan();
-    await disconnect();
+    await _scanSub?.cancel();
+    await _connSub?.cancel();
+    await _statSub?.cancel();
+    await _imuSub?.cancel();
     await _statusController.close();
     await _connStateController.close();
+    await _imuController.close();
   }
 }
