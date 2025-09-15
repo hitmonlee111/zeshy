@@ -1,17 +1,12 @@
-// 保持你发来的内容结构，只改了下载面板请求与少量细节
-
+// lib/pages/goggles_page.dart
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
-import 'dart:math' as math;
-import 'dart:ui' show FontFeature;
-
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_mjpeg/flutter_mjpeg.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter_reactive_ble/flutter_reactive_ble.dart' show DeviceConnectionState;
 
+import 'package:zeshy/pages/download_and_compose_page.dart';
 import 'package:zeshy/pages/pairing_sheet.dart';
 import 'package:zeshy/services/ble_provisioning_service.dart';
 
@@ -21,12 +16,9 @@ class GogglesPage extends StatefulWidget {
   State<GogglesPage> createState() => _GogglesPageState();
 }
 
-class _GogglesPageState extends State<GogglesPage> {
+class _GogglesPageState extends State<GogglesPage> with WidgetsBindingObserver {
   final _svc = BleProvisioningService();
-
-  final _ssidCtrl = TextEditingController();
-  final _passCtrl = TextEditingController();
-  final _nameFilterCtrl = TextEditingController(text: 'PROV_');
+  final _nameFilterCtrl = TextEditingController(text: 'DBG_');
 
   String _connStatus = '未连接';
   String _provStatus = '—';
@@ -34,66 +26,194 @@ class _GogglesPageState extends State<GogglesPage> {
   bool _scanning = false;
 
   String? _deviceIp;
+  bool _ipAlive = false;
   bool _streamError = false;
   int _streamEpoch = 0;
 
-  StreamSubscription<IMUSample>? _imuSub;
-  bool _imuOn = false;
-  int? _lastTs;
-  double _vx = 0, _vy = 0, _vz = 0;
-  double _speed = 0;
-
   StreamSubscription<String>? _statSubMain;
+  StreamSubscription<DeviceConnectionState>? _connSub;
+  Timer? _hbTimer;
+  int _hbMiss = 0;
+  static const _hbPeriod = Duration(seconds: 3);
+  static const _hbTolerance = 3;
   static const _kLastIpKey = 'last_device_ip';
+
+  // 下载期间“网络占用”标志（暂停 MJPEG + 心跳）
+  bool _netHeld = false;
+
+  // 新增：状态守望（兜底自愈 UI）
+  Timer? _consistencyTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);  // 监听前后台
     _loadLastIpAndTryUse();
+    _listenBleConnState();
     _listenStatInPage();
+    _startConsistencyWatchdog();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 关键：回前台时重绑订阅 + 立即刷新一次真实状态
+    if (state == AppLifecycleState.resumed) {
+      _appendLog('App resumed，重绑订阅并刷新状态。');
+      _listenBleConnState();   // 保险：重订阅 BLE 连接流
+      _listenStatInPage();     // 重订阅 STAT（固件 onSubscribe 会推送上次状态）
+      if (!_netHeld) _startHeartbeat();
+      _refreshStatuses();      // 主动探测 /status + 回填 BLE 文案
+    } else if (state == AppLifecycleState.paused) {
+      _appendLog('App paused，暂停心跳。');
+      _stopHeartbeat();
+    }
+  }
+
+  void _startConsistencyWatchdog() {
+    _consistencyTimer?.cancel();
+    _consistencyTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+      if (!mounted) return;
+      if (!_netHeld && _deviceIp != null) {
+        _refreshStatuses();
+      }
+    });
+  }
+
+  Future<void> _refreshStatuses() async {
+    // 1) 网络 + IP：直接探测 /status
+    final ip = _deviceIp;
+    if (ip != null) {
+      final ok = await _probeIp(ip);
+      if (!mounted) return;
+      setState(() {
+        _ipAlive = ok;
+        if (ok) {
+          // 如果 UI 还显示离线/—，拉回到“热点就绪”
+          if (_provStatus == '—' || _provStatus.contains('离线')) {
+            _provStatus = '热点就绪';
+          }
+        } else {
+          _provStatus = '热点离线';
+        }
+      });
+      if (ok) _resetStream(); // 回前台后 MJPEG 可能超时，成功就刷新
+    }
+
+    // 2) BLE 文案回填：利用 service 的最近状态
+    final st = _svc.isConnectedSync ? '已连接' : '未连接';
+    if (mounted && _connStatus != st) {
+      setState(() => _connStatus = st);
+    }
+  }
+
+  void _listenBleConnState() {
+    _connSub?.cancel();
+    _connSub = _svc.connectionState.listen((s) {
+      switch (s) {
+        case DeviceConnectionState.connecting:
+          _setConn('连接中…'); break;
+        case DeviceConnectionState.connected:
+          _setConn('已连接'); break;
+        case DeviceConnectionState.disconnected:
+          _setConn('未连接'); break;
+        case DeviceConnectionState.disconnecting:
+          _setConn('断开中…'); break;
+        default:
+          _setConn(s.toString());
+      }
+    });
+    // 立即用 service 的同步状态回填一次（防止刚进入时状态为空）
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_svc.isConnectedSync) {
+        _setConn('已连接');
+      }
+    });
+  }
+
+  void _setConn(String s) {
+    if (!mounted) return;
+    setState(() => _connStatus = s);
   }
 
   void _listenStatInPage() {
     _statSubMain?.cancel();
     _statSubMain = _svc.statusStream.listen((txt) async {
-      _appendLog('[STAT-MAIN] $txt');
-
+      _appendLog('[STAT] $txt');
       if (txt.startsWith('ap_on:')) {
         final ip = txt.substring('ap_on:'.length).trim();
-        await _saveLastIp(ip);
-        if (!mounted) return;
-        setState(() {
-          _deviceIp = ip;
-          _provStatus = '热点已开启';
-          _streamError = false;
-          _streamEpoch++;
-        });
-        return;
-      }
-      if (txt.startsWith('wifi_ok:')) {
-        final ip = txt.substring('wifi_ok:'.length).trim();
-        await _saveLastIp(ip);
-        if (!mounted) return;
-        setState(() {
-          _deviceIp = ip;
-          _provStatus = '已连上 Wi-Fi';
-          _streamError = false;
-          _streamEpoch++;
-        });
-        return;
-      }
-      if (txt.contains('wifi_connecting')) {
-        if (mounted) setState(() => _provStatus = '设备正在连接 Wi-Fi…');
-      } else if (txt.contains('wifi_fail_auth')) {
-        if (mounted) setState(() => _provStatus = 'Wi-Fi 密码错误');
-      } else if (txt.contains('wifi_fail_notfound')) {
-        if (mounted) setState(() => _provStatus = '找不到该 SSID');
-      } else if (txt.contains('ble_connected')) {
-        if (mounted) setState(() => _connStatus = '已连接');
+        await _acceptNewIp(ip, label: '热点已开启');
       } else if (txt.contains('ap_off')) {
-        if (mounted) setState(() => _provStatus = '热点已关闭');
+        _stopHeartbeat();
+        if (mounted) {
+          setState(() {
+            _provStatus = '热点已关闭';
+            _ipAlive = false;
+          });
+        }
+      } else if (txt.contains('ble_connected')) {
+        _setConn('已连接');
       }
     });
+  }
+
+  Future<void> _acceptNewIp(String ip, {required String label}) async {
+    await _saveLastIp(ip);
+    if (!mounted) return;
+    setState(() {
+      _deviceIp = ip;
+      _provStatus = label;
+      _streamError = false;
+      _ipAlive = true;
+      _streamEpoch++;
+    });
+    if (!_netHeld) _startHeartbeat();
+  }
+
+  void _startHeartbeat() {
+    _hbTimer?.cancel();
+    _hbMiss = 0;
+    if (_deviceIp == null) return;
+    _hbTimer = Timer.periodic(_hbPeriod, (_) async {
+      if (_netHeld) return; // 被占用时不探活
+      final ok = await _probeIp(_deviceIp!);
+      if (!mounted) return;
+      if (ok) {
+        if (!_ipAlive) setState(() => _ipAlive = true);
+        _hbMiss = 0;
+      } else {
+        _hbMiss++;
+        if (_hbMiss >= _hbTolerance) {
+          if (_ipAlive) {
+            setState(() {
+              _ipAlive = false;
+              _provStatus = '热点离线';
+            });
+          }
+        }
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _hbTimer?.cancel();
+    _hbTimer = null;
+    _hbMiss = 0;
+  }
+
+  // 统一在进入/退出下载页时“挂起/恢复网络”
+  void _holdNetwork(bool hold) {
+    if (_netHeld == hold) return;
+    setState(() {
+      _netHeld = hold;
+      _streamError = false;
+    });
+    if (hold) {
+      _stopHeartbeat();
+    } else {
+      _startHeartbeat();
+      _resetStream();
+    }
   }
 
   Future<void> _loadLastIpAndTryUse() async {
@@ -102,9 +222,14 @@ class _GogglesPageState extends State<GogglesPage> {
       final ip = sp.getString(_kLastIpKey);
       if (ip == null || ip.isEmpty) return;
       if (await _probeIp(ip)) {
-        setState(() => _deviceIp = ip);
+        if (!mounted) return;
+        setState(() {
+          _deviceIp = ip;
+          _ipAlive = true;
+        });
         _resetStream();
         _appendLog('使用上次保存的 IP：$ip');
+        if (!_netHeld) _startHeartbeat();
       } else {
         _appendLog('上次 IP 不可用：$ip');
       }
@@ -136,73 +261,6 @@ class _GogglesPageState extends State<GogglesPage> {
     });
   }
 
-  // ---- BLE IMU 开关 ----
-  Future<void> _toggleImu() async {
-    if (_imuOn) {
-      await _stopImuBle();
-    } else {
-      await _startImuBle();
-    }
-  }
-
-  Future<void> _startImuBle() async {
-    try {
-      await _svc.startImu();
-      _imuSub?.cancel();
-      _imuSub = _svc.imuStream.listen(_updateSpeedFromImuSample);
-      setState(() => _imuOn = true);
-      _appendLog('IMU 订阅已开启（BLE）');
-    } catch (e) {
-      _snack('IMU 订阅失败: $e');
-    }
-  }
-
-  Future<void> _stopImuBle() async {
-    await _svc.stopImu();
-    await _imuSub?.cancel();
-    _imuSub = null;
-    setState(() {
-      _imuOn = false;
-      _lastTs = null;
-      _vx = _vy = _vz = 0;
-      _speed = 0;
-    });
-    _appendLog('IMU 订阅已关闭');
-  }
-
-  void _updateSpeedFromImuSample(IMUSample s) {
-    final ts = s.ts;
-    final dt = (_lastTs == null) ? 0.04 : (ts - _lastTs!) / 1000.0; // 25Hz≈40ms
-    _lastTs = ts;
-
-    final ax = s.ax, ay = s.ay, az = s.az;
-
-    final roll  = math.atan2(ay, az);
-    final pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az));
-
-    const g = 9.80665;
-    final ax_ms2 = ax * g, ay_ms2 = ay * g, az_ms2 = az * g;
-
-    final sr = math.sin(roll),  cr = math.cos(roll);
-    final sp = math.sin(pitch), cp = math.cos(pitch);
-
-    final ax_w = ax_ms2 * cp + ay_ms2 * sr*sp + az_ms2 * cr*sp;
-    final ay_w = ay_ms2 * cr - az_ms2 * sr;
-    final az_w = -ax_ms2 * sp + ay_ms2 * sr*cp + az_ms2 * cr*cp;
-
-    final lin_ax = ax_w;
-    final lin_ay = ay_w;
-    final lin_az = az_w - g;
-
-    const decay = 0.985;
-    _vx = (_vx + lin_ax * dt) * decay;
-    _vy = (_vy + lin_ay * dt) * decay;
-    _vz = (_vz + lin_az * dt) * decay;
-
-    _speed = math.sqrt(_vx*_vx + _vy*_vy + _vz*_vz);
-    if (mounted) setState(() {});
-  }
-
   void _resetStream() {
     _streamError = false;
     _streamEpoch++;
@@ -211,7 +269,6 @@ class _GogglesPageState extends State<GogglesPage> {
 
   Future<void> _openPairingSheet() async {
     setState(() => _scanning = false);
-
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -223,29 +280,23 @@ class _GogglesPageState extends State<GogglesPage> {
       builder: (_) => PairingSheet(
         svc: _svc,
         nameFilterCtrl: _nameFilterCtrl,
-        ssidCtrl: _ssidCtrl,
-        passCtrl: _passCtrl,
         onLog: _appendLog,
         onConnStatus: (s) => setState(() => _connStatus = s),
         onProvStatus: (s) => setState(() => _provStatus = s),
         onDeviceIp: (ip) async {
-          await _saveLastIp(ip);
-          if (!mounted) return;
-          setState(() => _deviceIp = ip);
-          _resetStream();
+          await _acceptNewIp(ip, label: '热点就绪');
         },
         onScanningChanged: (b) => setState(() => _scanning = b),
         initialDeviceIp: _deviceIp,
       ),
     );
-
     try { await _svc.stopScan(); } catch (_) {}
     if (mounted) setState(() => _scanning = false);
   }
 
   Future<void> _openDownload() async {
-    if (_deviceIp == null) {
-      _appendLog('请求开启 AP 并等待 IP…');
+    if (_deviceIp == null || !_ipAlive) {
+      _appendLog('未检测到热点，尝试开启 AP 并等待 IP…');
       try { await _svc.setAp(true); }
       catch (e) { _snack('开启热点失败：$e'); return; }
 
@@ -254,9 +305,7 @@ class _GogglesPageState extends State<GogglesPage> {
       sub = _svc.statusStream.listen((s) async {
         if (s.startsWith('ap_on:')) {
           final ip = s.substring('ap_on:'.length).trim();
-          await _saveLastIp(ip);
-          if (!mounted) return;
-          setState(() => _deviceIp = ip);
+          await _acceptNewIp(ip, label: '热点已开启');
           comp.complete();
           await sub.cancel();
         }
@@ -266,16 +315,19 @@ class _GogglesPageState extends State<GogglesPage> {
     }
 
     if (!mounted) return;
-    await showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      backgroundColor: Colors.white,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (_) => _DownloadSheet(deviceIp: _deviceIp!, onLog: _appendLog),
-    );
+    if (_deviceIp == null || !_ipAlive) {
+      _snack('热点不可用，请重试');
+      return;
+    }
+
+    // 进入下载页前：挂起 MJPEG + 心跳
+    _holdNetwork(true);
+    await Navigator.of(context).push(MaterialPageRoute(
+      fullscreenDialog: true,
+      builder: (_) => DownloadAndComposePage(deviceIp: _deviceIp!),
+    ));
+    // 返回后：恢复
+    _holdNetwork(false);
   }
 
   void _snack(String msg) {
@@ -285,11 +337,12 @@ class _GogglesPageState extends State<GogglesPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _statSubMain?.cancel();
-    _imuSub?.cancel();
+    _connSub?.cancel();
+    _hbTimer?.cancel();
+    _consistencyTimer?.cancel();
     _svc.dispose();
-    _ssidCtrl.dispose();
-    _passCtrl.dispose();
     _nameFilterCtrl.dispose();
     super.dispose();
   }
@@ -337,8 +390,8 @@ class _GogglesPageState extends State<GogglesPage> {
                         const SizedBox(width: gap),
                         _StatusTile(
                           width: tileW, title: '网络',
-                          value: _provStatus,
-                          color: _statusColor(_provStatus, isConn: false),
+                          value: _ipAlive ? _provStatus : (_provStatus == '—' ? '—' : '离线'),
+                          color: _statusColor(_ipAlive ? _provStatus : '离线', isConn: false),
                         ),
                       ],
                     ),
@@ -356,7 +409,7 @@ class _GogglesPageState extends State<GogglesPage> {
                 ),
               ),
 
-              // 流 + 速度
+              // 流（下载期间不创建 MJPEG 连接）
               Padding(
                 padding: const EdgeInsets.all(12.0),
                 child: AspectRatio(
@@ -371,7 +424,7 @@ class _GogglesPageState extends State<GogglesPage> {
                       borderRadius: BorderRadius.circular(20),
                       child: Stack(
                         children: [
-                          if (_deviceIp != null && !_streamError)
+                          if (!_netHeld && _deviceIp != null && !_streamError && _ipAlive)
                             Positioned.fill(
                               child: Mjpeg(
                                 stream: 'http://${_deviceIp!}/stream?e=$_streamEpoch',
@@ -394,24 +447,16 @@ class _GogglesPageState extends State<GogglesPage> {
                                 alignment: Alignment.center,
                                 decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
                                 child: Text(
-                                  _deviceIp == null
+                                  _netHeld
+                                      ? '下载处理中，已暂停实时流…'
+                                      : _deviceIp == null
                                       ? '未获取到设备 IP。\n可通过“配对设备”→ 开启热点 或 等待加载上次 IP。'
-                                      : '流已断开（可能超时）\n请点击右上角刷新',
+                                      : (_ipAlive ? '流已断开（可能超时）\n请点击右上角刷新'
+                                      : '热点离线或不可达，请检查设备。'),
                                   textAlign: TextAlign.center, style: textTheme.titleMedium,
                                 ),
                               ),
                             ),
-                          Positioned(
-                            left: 8, top: 8,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                              decoration: BoxDecoration(color: Colors.black.withOpacity(0.45), borderRadius: BorderRadius.circular(12)),
-                              child: Text(
-                                '速度：${_speed.toStringAsFixed(2)} m/s',
-                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontFeatures: [FontFeature.tabularFigures()]),
-                              ),
-                            ),
-                          ),
                           Positioned(
                             right: 8, top: 8,
                             child: Tooltip(
@@ -420,7 +465,10 @@ class _GogglesPageState extends State<GogglesPage> {
                                 color: Colors.black.withOpacity(0.25), shape: const CircleBorder(),
                                 child: IconButton(
                                   icon: const Icon(Icons.refresh, color: Colors.white),
-                                  onPressed: (_deviceIp == null) ? null : () { _resetStream(); _appendLog('手动刷新 MJPEG 流。'); },
+                                  onPressed: (_deviceIp == null || !_ipAlive || _netHeld) ? null : () {
+                                    _resetStream();
+                                    _appendLog('手动刷新 MJPEG 流。');
+                                  },
                                 ),
                               ),
                             ),
@@ -439,15 +487,7 @@ class _GogglesPageState extends State<GogglesPage> {
                   children: [
                     Expanded(
                       child: FilledButton.icon(
-                        onPressed: _toggleImu,
-                        icon: Icon(_imuOn ? Icons.stop_circle_outlined : Icons.sensors),
-                        label: Text(_imuOn ? '停止同步 IMU' : '同步 IMU'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: FilledButton.icon(
-                        onPressed: _openDownload,
+                        onPressed: _netHeld ? null : _openDownload,
                         icon: const Icon(Icons.download),
                         label: const Text('下载视频'),
                       ),
@@ -488,202 +528,14 @@ class _GogglesPageState extends State<GogglesPage> {
   }
 }
 
-/* ------------------------- 下载弹窗 ------------------------- */
-
-class _DownloadSheet extends StatefulWidget {
-  const _DownloadSheet({required this.deviceIp, required this.onLog});
-  final String deviceIp;
-  final void Function(String) onLog;
-
-  @override
-  State<_DownloadSheet> createState() => _DownloadSheetState();
-}
-
-class _DownloadSheetState extends State<_DownloadSheet> {
-  bool _loading = true;
-  List<String> _sessions = [];
-  final Set<String> _selected = {};
-
-  @override
-  void initState() {
-    super.initState();
-    _loadSessions();
-  }
-
-  Future<void> _loadSessions() async {
-    setState(() => _loading = true);
-    try {
-      // 固件：/fs/list —— 返回 ["\/REC_...","\/REC_..."]
-      final r = await http.get(Uri.parse('http://${widget.deviceIp}/fs/list'))
-          .timeout(const Duration(seconds: 6));
-      if (r.statusCode == 200) {
-        final arr = (jsonDecode(r.body) as List).map((e) => e.toString()).toList();
-        setState(() => _sessions = arr);
-      } else {
-        _toast('HTTP ${r.statusCode}');
-      }
-    } catch (e) {
-      widget.onLog('加载会话失败: $e');
-      _toast('加载会话失败');
-    } finally {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _downloadSelected() async {
-    if (_selected.isEmpty) return;
-    final dir = await getApplicationDocumentsDirectory();
-
-    for (final raw in _selected) {
-      final sess = raw.startsWith('/') ? raw : '/$raw';
-      final sessName = sess.replaceFirst('/', ''); // 本地目录名如 REC_1234
-      final localSessDir = Directory('${dir.path}/$sessName');
-      if (!await localSessDir.exists()) await localSessDir.create(recursive: true);
-
-      // 1) 获取该会话下的文件列表
-      final listUrl = 'http://${widget.deviceIp}/fs/list?session=${Uri.encodeComponent(sess)}';
-      try {
-        final lr = await http.get(Uri.parse(listUrl)).timeout(const Duration(seconds: 6));
-        if (lr.statusCode != 200) { _toast('列文件失败: $sessName'); continue; }
-        final files = (jsonDecode(lr.body) as List).map((e) => e.toString()).toList();
-
-        // 2) 逐个拉取文件
-        for (final p in files) {
-          final path = p.startsWith('/') ? p : '/$p';
-          final fname = path.split('/').last;
-          final url = 'http://${widget.deviceIp}/fs/file?path=${Uri.encodeComponent(path)}';
-          final fr = await http.get(Uri.parse(url)).timeout(const Duration(minutes: 1));
-          if (fr.statusCode == 200) {
-            final out = File('${localSessDir.path}/$fname');
-            await out.writeAsBytes(fr.bodyBytes);
-          } else {
-            _toast('下载失败: $fname (${fr.statusCode})');
-          }
-        }
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('已保存到 ${localSessDir.path}')),
-          );
-        }
-      } catch (e) {
-        _toast('下载异常: $e');
-      }
-    }
-  }
-
-  Future<void> _deleteSelected() async {
-    if (_selected.isEmpty) return;
-    for (final raw in _selected.toList()) {
-      final sess = raw.startsWith('/') ? raw : '/$raw';
-      final url = 'http://${widget.deviceIp}/fs/delete?session=${Uri.encodeComponent(sess)}';
-      try {
-        final r = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
-        if (r.statusCode == 200) {
-          setState(() { _sessions.remove(raw); _selected.remove(raw); });
-        } else {
-          _toast('删除失败: HTTP ${r.statusCode}');
-        }
-      } catch (e) {
-        _toast('删除异常: $e');
-      }
-    }
-  }
-
-  void _toast(String s) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return DraggableScrollableSheet(
-      expand: false,
-      initialChildSize: 0.85,
-      minChildSize: 0.55,
-      maxChildSize: 0.98,
-      builder: (_, controller) {
-        return Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 8, 0),
-              child: Row(
-                children: [
-                  const Text('选择会话下载/删除', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
-                  const Spacer(),
-                  IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.of(context).pop()),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: _loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _sessions.isEmpty
-                  ? const Center(child: Text('暂无会话'))
-                  : ListView.builder(
-                controller: controller,
-                itemCount: _sessions.length,
-                itemBuilder: (_, i) {
-                  final s = _sessions[i];
-                  final picked = _selected.contains(s);
-                  return ListTile(
-                    title: Text(s, overflow: TextOverflow.ellipsis),
-                    trailing: Checkbox(
-                      value: picked,
-                      onChanged: (v) {
-                        setState(() { v == true ? _selected.add(s) : _selected.remove(s); });
-                      },
-                    ),
-                    onTap: () {
-                      setState(() {
-                        picked ? _selected.remove(s) : _selected.add(s);
-                      });
-                    },
-                  );
-                },
-              ),
-            ),
-            if (!_loading)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: FilledButton.icon(
-                        onPressed: _selected.isEmpty ? null : _downloadSelected,
-                        icon: const Icon(Icons.download),
-                        label: const Text('下载所选 (到本地文件夹)'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _selected.isEmpty ? null : _deleteSelected,
-                        icon: const Icon(Icons.delete_outline),
-                        label: const Text('删除所选'),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-/* ------------------------- 视觉组件 & 辅助函数 ------------------------- */
-
 Color _statusColor(String s, {required bool isConn}) {
   const connBase = Color(0xFF2563EB);
   const provBase = Color(0xFF7C3AED);
   final base = isConn ? connBase : provBase;
 
-  if (s.contains('已连接') || s.contains('已连上') || s.contains('热点已开启')) return base;
-  if (s.contains('失败') || s.contains('错误') || s.contains('找不到')) return const Color(0xFFEF4444);
-  if (s.contains('连接中') || s.contains('正在')) return const Color(0xFFF59E0B);
+  if (s.contains('已连接') || s.contains('热点已开启') || s.contains('就绪')) return base;
+  if (s.contains('离线')) return const Color(0xFFEF4444);
+  if (s.contains('连接中')) return const Color(0xFFF59E0B);
   return const Color(0xFF64748B);
 }
 
